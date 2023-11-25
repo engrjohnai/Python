@@ -1,0 +1,94 @@
+# This code is written in Python. The code fetches JSON data from an API, parses the data, calculates monthly metrics
+# based on the parsed data, and sends the metrics to another API (The same in this case). The main function orchestrates the execution of
+# fetching logs, parsing logs, calculating metrics, and sending metrics to the API. The code uses the requests
+# library for making HTTP requests and the base64 and json libraries for encoding and decoding data.
+
+import base64
+import json
+import requests
+from datetime import datetime, timedelta
+
+# Set authorization header
+authorization_header = "SRAD " + base64.b64encode(b"John Akpan").decode("utf-8")
+
+# Fetch JSON from API
+url = "https://webhook.site/edce86eb-ad00-4ee2-a3cd-c64a0ec32192"
+response = requests.get(url, headers={"Authorization": authorization_header})
+
+# Parse JSON
+parsed_logs = json.loads(response.content)
+
+
+def parse_logs(logs):
+    parsed_logs = []
+    for log in logs:
+        event_id = log['id']
+        analyst = log['analyst']
+        time_stamp = datetime.strptime(log['timestamp'], '%Y-%m-%d %H:%M')
+        # Creates a dictionary with the extracted information (event_id, analyst, time_stamp)
+        # Append it to the parsed_logs list
+        parsed_logs.append({'id': event_id, 'analyst': analyst, 'timestamp': time_stamp})
+    return parsed_logs
+
+
+def calculate_metrics(parsed_logs):
+    # Create an empty dictionary to store monthly metrics
+    monthly_metrics = {}
+
+    # Iterate over each log in the parsed logs
+    for log in parsed_logs:
+        # Extract the month key from the log timestamp and format it
+        month_key = log['timestamp'].strftime('%Y-%m-%d %H:%M')
+
+        # Check if the month key is not already in monthly_metrics, if not, initialize it
+        if month_key not in monthly_metrics:
+            monthly_metrics[month_key] = {'MTTRespond': [], 'MTTResolve': []}
+
+        # Append the log timestamp to the MTTRespond list for the corresponding month key
+        monthly_metrics[month_key]['MTTRespond'].append(log['timestamp'])
+
+        # Calculate the resolution time (timestamp + 30 minutes) and append to the MTTResolve list
+        resolution_time = log['timestamp'] + timedelta(minutes=30)  # Assuming it takes 30 mins to resolve a ticket.
+        monthly_metrics[month_key]['MTTResolve'].append(resolution_time)
+
+    # Iterate over each month and its metrics in monthly_metrics
+    for month, metrics in monthly_metrics.items():
+        # Calculate the time differences in minutes for MTTRespond and MTTResolve
+        respond_times = [(t - metrics['MTTRespond'][i - 1]).total_seconds() // 60 for i, t in
+                         enumerate(metrics['MTTRespond']) if i > 0]
+        resolve_times = [(t - metrics['MTTResolve'][i - 1]).total_seconds() // 60 for i, t in
+                         enumerate(metrics['MTTResolve']) if i > 0]
+
+        # Calculate the mean time to respond and resolve
+        mean_time_to_respond = sum(respond_times) / len(respond_times) if respond_times else 0
+        mean_time_to_resolve = sum(resolve_times) / len(resolve_times) if resolve_times else 0
+
+        # Update monthly_metrics with the calculated mean times
+        monthly_metrics[month] = {'MTTRespond': round(mean_time_to_respond), 'MTTResolve': round(mean_time_to_resolve)}
+
+    # Return the final monthly_metrics dictionary
+    return monthly_metrics
+
+
+def send_metrics_to_api(metrics):
+    headers = {
+        'Authorization': AUTH_HEADER,
+        'Content-Type': 'application/json'
+    }
+    response = requests.post(API_ENDPOINT, json=metrics, headers=headers)
+    return response.json()
+
+
+def fetch_logs():
+    pass
+
+
+def main():
+    logs = fetch_logs()
+    parsed_logs = parse_logs(logs)
+    monthly_metrics = calculate_metrics(parsed_logs)
+    response = send_metrics_to_api(monthly_metrics)
+
+
+if __name__ == "__main__":
+    url = "https://webhook.site/edce86eb-ad00-4"
