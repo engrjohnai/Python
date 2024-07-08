@@ -13,3 +13,23 @@ class Dog:
         return f"{self.name} says {self.sound}"
 
 
+'''
+class Car:
+    brand = "X"
+    def __init__(self, name, year, color, mileage):
+        self.name = name   
+        self.year = year    
+        self.color = color 
+        self.mileage = mileage 
+
+    def __add__(self, other):
+        self.mileage = self.mileage + other.mileage
+
+    def drive(self, other):
+        return f"New mileage: {self.mileage}"
+
+    def __str__(self):
+        return f"Car: {self.name}, {self.year}, {self.color}, {self.mileage}"
+
+
+
