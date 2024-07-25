@@ -1,0 +1,309 @@
+import os
+import json
+import base64
+import requests
+import boto3
+from botocore.exceptions import ClientError
+
+"""
+Zendesk -- Contract Logix Integration Lambda.
+This AWS Lambda function creates a contract and associated entities based on a set of input JSON data.
+It integrates with the Contract Logix (CLX) API and retrieves necessary data from Zendesk (ZD).
+"""
+
+# Lambda configured/expected environment variables
+CLX_BASE_URL = os.getenv('BASE_URL')
+CLX_STAGE = os.getenv('STAGE')
+DEFAULT_ORG_OWNERSHIP = os.getenv('DEFAULT_ORG_OWNERSHIP')
+ZD_BASE_URL = os.getenv('ZD_BASE_URL')
+ZD_STAGE = os.getenv('ZD_STAGE')
+
+# Contract Types Supported
+NDA_CONTRACT_TYPE = 'Non-Disclosure Agreement'
+SUPPORTED_CONTRACT_TYPES = [NDA_CONTRACT_TYPE]
+
+# Entity defaults/static values
+CONTRACT_CONTACT_ASSOCIATION_TYPE_EXT_SIGNATORY = 'Signatory (External)'
+CONTRACT_CONTACT_ASSOCIATION_TYPE_EXT_COORDINATOR = 'Contract Coordinator'
+CONTACT_TYPE_EXT = 'External'
+ORGANIZATION_TYPE_EXT = 'External'
+
+# Status value when creation is complete to trigger CLX workflows
+CONTRACT_STATUS_PENDING = 'Pending'
+
+def get_secret(secret_name, region_name="eu-west-2"):
+    """
+    Retrieve a secret from AWS Secrets Manager.
+    """
+    session = boto3.session.Session()
+    client = session.client(
+        service_name='secretsmanager', 
+        region_name=region_name
+    )
+    
+    try:
+        get_secret_value_response = client.get_secret_value(
+            SecretId=secret_name
+        )
+        if 'SecretString' in get_secret_value_response:
+            secret = get_secret_value_response['SecretString']
+            return json.loads(secret)
+        else:
+            raise Exception("SecretString not found in the response")
+    except ClientError as e:
+        raise Exception(f"Error retrieving secret: {str(e)}")
+
+def basic_auth(username, password):
+    """
+    Generate a Basic Auth header value from a username and password.
+    """
+    token = base64.b64encode(f"{username}:{password}".encode('utf-8')).decode("ascii")
+    return f'Basic {token}'
+
+def get_clx_bearer_token(client_id, client_secret, token_url):
+    """
+    Obtain a Bearer Token from the Contract Logix API using client credentials.
+    """
+    auth_str = f"{client_id}:{client_secret}"
+    b64_auth_str = base64.b64encode(auth_str.encode()).decode()
+    headers = {
+        'Authorization': f"Basic {b64_auth_str}",
+        'Content-Type': 'application/x-www-form-urlencoded'
+    }
+    payload = {
+        'grant_type': 'client_credentials', 
+        'scope': 'IdentityServerApi'
+    }
+
+    response = requests.post(token_url, headers=headers, data=payload)
+    response_data = response.json()
+    if 'access_token' in response_data:
+        return response_data['access_token']
+    else:
+        raise Exception("Failed to obtain access token")
+
+def make_api_request(headers, api_url, json_body, action='post'):
+    """
+    Make a POST or PUT API request to the given URL with the specified JSON body.
+    """
+    headers['Content-Type'] = 'application/json'
+    try:
+        if action == 'put':
+            response = requests.put(api_url, headers=headers, data=json_body)
+        else:
+            response = requests.post(api_url, headers=headers, data=json_body)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"{action.capitalize()} request error: {e}")
+
+def make_api_get_request(headers, api_url, dump_json=True):
+    """
+    Make a GET API request to the given URL.
+    """
+    try:
+        response = requests.get(api_url, headers=headers)
+        response.raise_for_status()
+        if dump_json:
+            return response.json()
+        return response.content
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Get request error: {e}")
+
+def find_or_create_external_organization(headers, org_dict):
+    """
+    Find or create an external organization in Contract Logix.
+    """
+    url_template = f'{CLX_BASE_URL}/external/api/organizations?filter=name eq "{{org_name}}"&fields=id,name,city,d/b/a'
+    get_org_api_url = url_template.format(org_name=org_dict.get('city'))
+
+    orgs = make_api_get_request(headers, get_org_api_url)
+    matched_org = None
+    if orgs:
+        if org_dict.get('d/b/a'):
+            matched_org = next((x for x in orgs if x.get('city') == org_dict.get('city') and x.get('d/b/a') == org_dict.get('d/b/a')), None)
+        else:
+            matched_org = next((x for x in orgs if x.get('city') == org_dict.get('city')), None)
+    
+    if matched_org:
+        return matched_org
+
+    org_dict['organizationType'] = ORGANIZATION_TYPE_EXT
+    org_dict['organizationOwnerships'] = [DEFAULT_ORG_OWNERSHIP]
+    return make_api_request(
+        headers, f"{CLX_BASE_URL}/external/api/organizations", 
+        json.dumps(org_dict)
+    )
+
+def find_or_create_ext_contact(headers, contact_dict):
+    """
+    Find or create an external contact in Contract Logix.
+    """
+    url_template = f'{CLX_BASE_URL}/external/api/contacts?filter=name eq "{{full_name}}"&fields=id,name,organization'
+    find_org_url = url_template.format(full_name=f"{contact_dict.get('firstName')} {contact_dict.get('lastName')}")
+    contacts = make_api_get_request(headers, find_org_url)
+
+    if contacts:
+        contact = next((x for x in contacts if x.get('organization') == contact_dict.get('organization')), None)
+        if contact:
+            return contact
+
+    contact_dict['contactType'] = CONTACT_TYPE_EXT
+    contact_dict['organizationOwnerships'] = [DEFAULT_ORG_OWNERSHIP]
+    return make_api_request(headers, f"{CLX_BASE_URL}/external/api/contacts", json.dumps(contact_dict))
+
+def create_contract(headers, contract_dict):
+    """
+    Create a contract in Contract Logix.
+    """
+    contract_api_url = f"{CLX_BASE_URL}/external/api/contracts"
+    contract_dict['organizationOwnerships'] = [DEFAULT_ORG_OWNERSHIP]
+    return make_api_request(headers, contract_api_url, json.dumps(contract_dict))
+
+def associate_contact_to_contract(headers, contract_id, association_dict):
+    """
+    Associate a contact to a contract in Contract Logix.
+    """
+    associate_api = f"{CLX_BASE_URL}/external/api/contracts/{contract_id}/contacts"
+    return make_api_request(headers, associate_api, json.dumps(association_dict))
+
+def update_contract(headers, contract_id, contract_dict):
+    """
+    Update a contract in Contract Logix.
+    """
+    contract_api_url = f"{CLX_BASE_URL}/external/api/contracts/{contract_id}"
+    contract_dict['organizationOwnerships'] = [DEFAULT_ORG_OWNERSHIP]
+    return make_api_request(headers, contract_api_url, json.dumps(contract_dict), 'put')
+
+def upload_attachment(headers, contract_id, content_type, filename, data):
+    """
+    Upload an attachment to a contract in Contract Logix.
+    """
+    doc_url = f"{CLX_BASE_URL}/external/api/documents"
+    doc_dict = {
+        'documentType': 'Contract',
+        'contentType': content_type,
+        'file': filename,
+        'parentrecordtype': 'Contract',
+        'parentrecordid': str(contract_id),
+        'organizationOwnerships': [DEFAULT_ORG_OWNERSHIP],
+        'content': data
+    }
+    doc = make_api_request(headers, doc_url, json.dumps(doc_dict))
+    print(f"Attachment uploaded to CLX: {doc.get('id')}")
+
+def retrieve_and_upload_attachments(headers, ticket_id, contract_id):
+    """
+    Retrieve attachments from a Zendesk ticket and upload them to a contract in Contract Logix.
+    """
+    secrets = get_secret(f"clx/{CLX_STAGE}")
+    username = secrets[f"zd_{ZD_STAGE}_username"]
+    api_token = secrets[f"zd_{ZD_STAGE}_api_token"]
+    zd_get_url = f"{ZD_BASE_URL}/api/v2/tickets/{ticket_id}/comments.json"
+    auth_headers = {'Authorization': basic_auth(f"{username}/token", api_token)}
+
+    try:
+        comments = make_api_get_request(auth_headers, zd_get_url).get('comments', [])
+        for comment in comments:
+            for attachment in comment.get('attachments', []):
+                filename = attachment.get('file_name')
+                content_type = attachment.get('content_type')
+                content_url = attachment.get('content_url')
+                print(f"Processing attachment filename <{filename}>")
+                binary_content = make_api_get_request(None, content_url, dump_json=False)
+                encoded_data = base64.b64encode(binary_content).decode('ascii')
+                upload_attachment(headers, contract_id, content_type, filename, encoded_data)
+    except Exception as e:
+        print(f"Failed to process attachments for contractId: {contract_id} \n {str(e)}")
+
+def lambda_handler(event, context):
+    """
+    Main entry point for the Lambda function.
+    Processes the event data, integrates with CLX and ZD, and creates a contract.
+    """
+    token_url = f"{CLX_BASE_URL}/connect/token"
+
+    try:
+        secrets = get_secret(f"clx/{CLX_STAGE}")
+        client_id = secrets[f"clx_{CLX_STAGE}_client_id"]
+        client_secret = secrets[f"clx_{CLX_STAGE}_client_secret"]
+    except Exception as e:
+        return {'statusCode': 500, 'body': json.dumps(f"Failed to load secret: {str(e)}")}
+
+    try:
+        token = get_clx_bearer_token(client_id, client_secret, token_url)
+        simple_headers = {'Authorization': f"Bearer {token}"}
+    except Exception as e:
+        return {'statusCode': 500, 'body': json.dumps(f"Failed to obtain CLX token: {str(e)}")}
+
+    try:
+        request_dict = json.loads(event.get('body'))
+        
+        if not request_dict:
+            raise ValueError("No body found in the event")
+
+        if request_dict.get('contractType') not in SUPPORTED_CONTRACT_TYPES:
+            raise ValueError(f"Contract type '{request_dict.get('contractType')}' not supported")
+
+        ext_org_dict = {
+            'city': request_dict.get('externalOrganizationCity'),
+            'd/b/a': request_dict.get('externalOrganizationDba')
+        }
+        ext_org = find_or_create_external_organization(simple_headers, ext_org_dict)
+
+        ext_contact_dict = {
+            'firstName': request_dict.get('externalSignatoryFirstName'),
+            'lastName': request_dict.get('externalSignatoryLastName'),
+            'email': request_dict.get('externalSignatoryEmail'),
+            'organization': {'id': ext_org.get('id')},
+            'title': request_dict.get('externalSignatoryTitle')
+        }
+        ext_contact = find_or_create_ext_contact(simple_headers, ext_contact_dict)
+
+        ext_coordinator_dict = {
+            'firstName': request_dict.get('externalCoordinatorFirstName'),
+            'lastName': request_dict.get('externalCoordinatorLastName'),
+            'email': request_dict.get('externalCoordinatorEmail'),
+            'organization': {'id': ext_org.get('id')},
+            'title': request_dict.get('externalCoordinatorTitle')
+        }
+        ext_coordinator_contact = find_or_create_ext_contact(simple_headers, ext_coordinator_dict)
+
+        contract_dict = {
+            'externalParties': [ext_org],
+            'title': request_dict.get('contractTitle'),
+            'contractType': request_dict.get('contractType'),
+            'contractStartDate': request_dict.get('contractStartDate'),
+            'contractEndDate': request_dict.get('contractEndDate'),
+            'externalContractingPartyType': 'Organization',
+            'status': CONTRACT_STATUS_PENDING
+        }
+        contract = create_contract(simple_headers, contract_dict)
+        contract_id = contract.get('id')
+
+        ext_contact_association_dict = {
+            'contractContactAssociationType': CONTRACT_CONTACT_ASSOCIATION_TYPE_EXT_SIGNATORY,
+            'contact': ext_contact
+        }
+        associate_contact_to_contract(simple_headers, contract_id, ext_contact_association_dict)
+
+        ext_coordinator_association_dict = {
+            'contractContactAssociationType': CONTRACT_CONTACT_ASSOCIATION_TYPE_EXT_COORDINATOR,
+            'contact': ext_coordinator_contact
+        }
+        associate_contact_to_contract(simple_headers, contract_id, ext_coordinator_association_dict)
+
+        additional_fields = request_dict.get('contractAdditionalFields')
+        if additional_fields:
+            update_contract(simple_headers, contract_id, {'additionalFields': additional_fields})
+
+        ticket_id = request_dict.get('ticketId')
+        if ticket_id:
+            retrieve_and_upload_attachments(simple_headers, ticket_id, contract_id)
+
+        return {'statusCode': 201, 'body': json.dumps(f"Contract created: {contract_id}")}
+
+    except ValueError as ve:
+        return {'statusCode': 400, 'body': json.dumps(str(ve))}
+    except Exception as e:
+        return {'statusCode': 500, 'body': json.dumps(f"Internal server error: {str(e)}")}
