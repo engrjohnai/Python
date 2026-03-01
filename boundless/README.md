@@ -1,0 +1,1 @@
+Determine if the secret_number is infinite and save your findings in the variable check.
